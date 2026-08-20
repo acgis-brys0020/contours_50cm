@@ -9,21 +9,17 @@ Date: 2026-06-16
 ArcGIS Version: 3.5.4
 
 Description: 
-    Generates and cleans contours from a DTM image. Moves across a gridded study area to generate contours for each cell, then merges them back together.
+    Generates and cleans contours from a DTM image.
 
 Parameters:
     workspace:                  Geodatabase/workspace           Input       The geodatabase workspace
     imagery:                    Raster layer OR mosaic layer    Input       The source DTM imagery
     working_area:               Feature Layer (polygon)         Input       The study area grid
     breaklines:                 Feature layer OR raster layer   Input       Hydro breaklines
-    dangle_threshold:           Integer                         Input       Maximum length of dangles to be removed (m)
     loop_threshold:             Integer                         Input       Maximum length of loops to be removed (m)
-    smoothing_threshold:        Integer                         Input       Smoothing tolerance
-    simplification_threshold:   Integer                         Input       Simplification tolerance
+    simplification_threshold:   Integer                         Input       Simplification tolerance (map units, metres)
     output_fc:                  Feature Class                   Output      Output location for the final smoothed contours
 
-Usage:
-    Intended for use with large study areas where running the ArcGIS Pro Contour tool on the whole area would be prohibitively demanding.
 =================================================
 """
 
