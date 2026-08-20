@@ -303,20 +303,20 @@ def scan_features(fc, results, loop_threshold):
             if not geom:
                 continue
             
-            #Remove all tiny pieces
+            #1. Remove all tiny pieces
             if length < MIN_FRAGMENT_LENGTH:
                 results.candidate_oids.add(oid)
                 results.fragments += 1
                 continue
                 
-            #1. Remove small loops
+            #2. Remove small loops
             is_loop = is_closed_loop(geom)
             if is_loop and length < loop_threshold:
                 results.candidate_oids.add(oid)
                 results.small_loops += 1
                 continue
             
-            #2. Detect weird artifacts
+            #3. Detect self-intersections
             weird_geometry = detect_suspect_geometry(geom)
             if weird_geometry:
                 smallest_gap = min(end-start for _, start, end in weird_geometry)
@@ -326,11 +326,10 @@ def scan_features(fc, results, loop_threshold):
                 
             #< Old duplicate script went here >
 
-            #4. Exclude any remaining features touching the AOI boundary
+            #4. Exclude any remaining features touching the AOI boundary and remove floating segments
             if oid in results.touching_oids:
                 continue
             
-            #5. Remove floating segments
             if is_floating_segment(geom, endpoint_counts) and length <= 20:
                 results.candidate_oids.add(oid)
                 results.floating += 1
