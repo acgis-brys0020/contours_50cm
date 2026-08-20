@@ -3,25 +3,17 @@ cleanup.py
 
 Contour cleaning routines used by the Contour Toolbox.
 
-clean_contours() loops through the remove_artifacts() function until there are either 
-no more artifacts to remove, or a threshold number of iterations is reached.
-
 ----------------------------------------------------------------------------------------
-1.  The endpoints of the contour lines are extracted and their connectivity is documented.
-    The connectivity (c) of a line's endpoints (p1, p2) is defined as the number of other endpoints each endpont overlaps with.
-        >   i.e., a segment sandwiched between two other segments would have connectivity values of c1 = 1, c2 = 1. 
-            A loop would also have c1 = 1, c2 =1. A free-floating segment would have c1 = 0, c2 = 0.
+1.  Candidate features for removal are compiled into a list by Object ID. These include:
+        a)  Small loops:            Features under a threshold length whose start and end points overlap.
+        b)  Fragments:              Any piece under 10 metres.   
+        c)  Floating segments:      Neither endpoint of the segment is connected to another lines or touching the AOI.
 
-2.  Candidate features for removal are compiled into a list by Object ID. These include:
-        a)  Small loops:                    Features under a threshold length whose start and end points overlap)
-        b)  Dangles:                        Only one endpoint has c = 0; the other is connected to at least one other line.        
-        c)  Floating segments:              Neither endpoint is connected to other lines.
-        d)  Duplicate segments:             Two or more non-loop segments share identical endpoints.
-        e)  Four-way intersections loops:   A loop whose start/endpoint are also connected to at least two other points.
+2.  In each segment, the coordinates of each point are evaluated. If two points share the same coordinates and the shape is NOT a loop, the segment is inspected further.
+    3.1.    Segments with possible self-overlaps are dissolved and the geometry is scanned for knots, fragments, and duplicate segments.
+    3.2.    Artifacts are removed and the segment is dissolved back together. Cleaned segments replace the originals.
 
-3.  Line segments that are touching the study area boundary are removed from the candidate list
-
-4.  Remaining candidates are deleted
+3.  Candidates found in step 1 are deleted.
 ----------------------------------------------------------------------------------------
 """
 
@@ -106,13 +98,10 @@ def detect_suspect_geometry(geom, min_sep = 5):
         if (coord == start_vertex and i == len(vertices) - 1):
             continue
 
-        if coord in seen:
-            first_idx = seen[coord]
-
+        first_idx = seen.get(coord)
+        if first_idx is not None:
             if i - first_idx >= min_sep:
-                duplicates.append(
-                    (coord, first_idx, i)
-                )
+                duplicates.append((coord, first_idx, i)) 
         else:
             seen[coord] = i
 
@@ -129,8 +118,8 @@ def is_floating_segment(geom, endpoint_counts):
    
 def build_endpoint_counts(fc):
     endpoint_counts = defaultdict(int)
-    with arcpy.da.SearchCursor(fc, ["OID@", "SHAPE@"]) as cursor:
-        for _, geom in cursor:
+    with arcpy.da.SearchCursor(fc, ["SHAPE@"]) as cursor:
+        for (geom,) in cursor:
             if not geom:
                 continue
             p1, p2 = get_points(geom)
@@ -181,13 +170,13 @@ def detect_knots(out_fc, suspect_artifact_ids, uid, dissolved_fc, out_fc_oid_fie
 
     #Isolates features that are under a certain length and connected to fewer than two features, which suggests a knot.
     arcpy.AddMessage("Searching for removal candidates...")
-    artifact_candidates = set()
+    removal_candidates = set()
     with arcpy.da.SearchCursor(joined_fc, ["OID@", "SHAPE@LENGTH", "Join_Count"]) as cursor:
         for oid, length, join_count in cursor:
             if length < MAX_KNOT_LENGTH and join_count <= MAX_KNOT_CONNECTIONS:
-                artifact_candidates.add(oid)
-    arcpy.AddMessage(f"Found {len(artifact_candidates)} artifacts for removal.")
-    return artifact_candidates, dissolved_fc
+                removal_candidates.add(oid)
+    arcpy.AddMessage(f"Found {len(removal_candidates)} artifacts for removal.")
+    return removal_candidates, dissolved_fc
 
 def remove_fragments(dissolved_fc, complex_orig_ids, counts):
     """Removes very small pieces that may be created by the dissolve."""
@@ -304,6 +293,51 @@ def replace_suspect_geometry(out_fc, suspect_artifact_ids, dissolved_fc, artifac
         return out_fc
     return out_fc
 
+def scan_features(fc, results, loop_threshold):
+    arcpy.AddMessage("Creating connectivity...") 
+    endpoint_counts = build_endpoint_counts(fc)
+    t0 = time.time()
+    with arcpy.da.SearchCursor(fc, ["OID@", "SHAPE@", "SHAPE@LENGTH"]) as cursor:
+        for oid, geom, length in cursor:
+            
+            if not geom:
+                continue
+            
+            #Remove all tiny pieces
+            if length < MIN_FRAGMENT_LENGTH:
+                results.candidate_oids.add(oid)
+                results.fragments += 1
+                continue
+                
+            #1. Remove small loops
+            is_loop = is_closed_loop(geom)
+            if is_loop and length < loop_threshold:
+                results.candidate_oids.add(oid)
+                results.small_loops += 1
+                continue
+            
+            #2. Detect weird artifacts
+            weird_geometry = detect_suspect_geometry(geom)
+            if weird_geometry:
+                smallest_gap = min(end-start for _, start, end in weird_geometry)
+                if smallest_gap < MAX_DUPLICATE_GAP:
+                    results.suspect_oids.add(oid)
+                    continue
+                
+            #< Old duplicate script went here >
+
+            #4. Exclude any remaining features touching the AOI boundary
+            if oid in results.touching_oids:
+                continue
+            
+            #5. Remove floating segments
+            if is_floating_segment(geom, endpoint_counts) and length <= 20:
+                results.candidate_oids.add(oid)
+                results.floating += 1
+                continue
+        end_time = time.time() - t0
+        arcpy.AddMessage(f"Looped through all features for initial artifact detection {end_time}.")
+
 def remove_artifacts(fc, loop_threshold, aoi):
     """Removes dangles, 3/4 way intersections, and redundant lines."""
     
@@ -313,7 +347,6 @@ def remove_artifacts(fc, loop_threshold, aoi):
         "floating" : 0,
         "other_artifacts" : 0}
         
-    suspect_artifact_ids = set()
     uid = str(uuid.uuid4())[:8]
     
     working_layer = f"working_layer_{uid}"
@@ -324,8 +357,19 @@ def remove_artifacts(fc, loop_threshold, aoi):
                   rf"memory\knot_fc_{uid}",
                   rf"memory\no_artifacts_{uid}",
                   rf"memory\joined_fc_{uid}"]
-    
     try:
+        from dataclasses import dataclass, field
+
+        @dataclass
+        class ScanResults:
+            touching_oids: set = field(default_factory = set)
+            suspect_oids: set = field(default_factory = set)
+            candidate_oids: set = field(default_factory = set)
+
+            fragment_count: int = 0
+            loop_count: int = 0
+            floating_count: int = 0
+
         arcpy.management.CopyFeatures(fc, out_fc)
         out_fc_oid_field = arcpy.Describe(fc).OIDFieldName
         #Add ORIG_ID field to the features
@@ -341,87 +385,48 @@ def remove_artifacts(fc, loop_threshold, aoi):
 
         #Determine which features are touching the AOI boundaries so they can be excluded
         touching_oids = touching_boundary(out_fc, working_layer, aoi)
-        arcpy.AddMessage(f"Features touching AOI boundary detected: {len(touching_oids)}")
+        results = ScanResults(touching_oids= touching_oids)
+
+        arcpy.AddMessage(f"Features touching AOI boundary detected: {len(results.touching_oids)}")
 
         #-- scan features --
-        candidate_oids = set()
-        pair_best = {}
-    
-        arcpy.AddMessage("Creating connectivity...") 
-        endpoint_counts = build_endpoint_counts(out_fc)
-        start_time = time.time()
-        with arcpy.da.SearchCursor(out_fc, ["OID@", "SHAPE@", "SHAPE@LENGTH"]) as cursor:
-            for oid, geom, length in cursor:
-                
-                if not geom:
-                    continue
-                
-                #Remove all tiny pieces
-                if length < MIN_FRAGMENT_LENGTH:
-                    candidate_oids.add(oid)
-                    counts["fragments"] += 1
-                    continue
-                     
-                #1. Remove small loops
-                is_loop = is_closed_loop(geom)
-                if is_loop and length < loop_threshold:
-                    candidate_oids.add(oid)
-                    counts["small_loops"] += 1
-                    continue
-                
-                #2. Detect weird artifacts
-                weird_geometry = detect_suspect_geometry(geom)
-                if weird_geometry:
-                    smallest_gap = min(end-start for _, start, end in weird_geometry)
-                    if smallest_gap < MAX_DUPLICATE_GAP:
-                        suspect_artifact_ids.add(oid)
-                        continue
-                    
-                #Old duplicate script went here
+        arcpy.AddMessage("Scanning features...") 
+        scan_features(out_fc, results, loop_threshold)
 
-                #4. Exclude any remaining features touching the AOI boundary
-                if oid in touching_oids:
-                    continue
-                
-                #5. Remove floating segments
-                if is_floating_segment(geom, endpoint_counts) and length <= 20:
-                    candidate_oids.add(oid)
-                    counts["floating"] += 1
-                    continue
-        end_time = time.time() - start_time
-        arcpy.AddMessage(f"Looped through all features for initial artifact detection {end_time}.")
         arcpy.AddMessage("Detecting knots...")
-        artifact_candidates, dissolved_fc = detect_knots(
+        removal_candidates, dissolved_fc = detect_knots(
             out_fc = out_fc, 
-            suspect_artifact_ids = suspect_artifact_ids, 
+            suspect_artifact_ids = results.suspect_oids, 
             uid = uid, 
             dissolved_fc= dissolved_fc, 
             out_fc_oid_field=out_fc_oid_field)
+        
         arcpy.AddMessage("Replacing suspect geometry...")
         out_fc = replace_suspect_geometry(
                     out_fc,
-                    suspect_artifact_ids,
+                    results.suspect_oids,
                     dissolved_fc,
-                    artifact_candidates,
+                    removal_candidates,
                     uid,
                     counts,
                     out_fc_oid_field
                 )
 
-        total_artifacts = (len(candidate_oids) + len(artifact_candidates))
+        total_artifacts = (len(results.candidate_oids) + len(removal_candidates))
         if total_artifacts == 0:
             arcpy.AddMessage(f"No artifacts left to remove. Nice!")
             return out_fc, 0
         else:
-            arcpy.AddMessage(f"Candidate features identified for removal: {candidate_oids}")
+            arcpy.AddMessage(f"Candidate features identified for removal: {results.candidate_oids}")
             arcpy.AddMessage("\n --- Artifact Summary ---")
-            for k, v in counts.items():
-                arcpy.AddMessage(f"{k}: {v}")
-        
+            arcpy.AddMessage(f"Fragments: {results.fragment_count}")
+            arcpy.AddMessage(f"Small loops: {results.loop_count}")
+            arcpy.AddMessage(f"Floating: {results.floating_count}")
+
         # -- Remove candidates ---
         arcpy.AddMessage(f"Removing candidates...")
         deleter(working_layer)
-        make_layer(out_fc, candidate_oids, out_fc_oid_field, working_layer, "IN")
+        make_layer(out_fc, results.candidate_oids, out_fc_oid_field, working_layer, "IN")
         selected = int(arcpy.management.GetCount(working_layer)[0])
         before = int(arcpy.management.GetCount(out_fc)[0])
 
